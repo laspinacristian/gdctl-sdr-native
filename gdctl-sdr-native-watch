@@ -1,0 +1,136 @@
+#!/usr/bin/python3
+"""Keep sdr-native enabled after Mutter monitor reconfigurations."""
+
+import os
+import subprocess
+import sys
+from gi.repository import Gio, GLib
+
+BUS_NAME = "org.gnome.Mutter.DisplayConfig"
+OBJECT_PATH = "/org/gnome/Mutter/DisplayConfig"
+INTERFACE = BUS_NAME
+TARGET_CONNECTOR = os.environ.get("GDCTL_SDR_CONNECTOR", "eDP-1")
+SDR_NATIVE = 2
+
+TRANSFORMS = {
+    0: "normal",
+    1: "90",
+    2: "180",
+    3: "270",
+    4: "flipped",
+    5: "flipped-90",
+    6: "flipped-180",
+    7: "flipped-270",
+}
+COLOR_MODES = {0: "default", 1: "bt2100", 2: "sdr-native"}
+RGB_RANGES = {1: "auto", 2: "full", 3: "limited"}
+
+bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+pending_check = 0
+
+
+def current_state():
+    result = bus.call_sync(
+        BUS_NAME,
+        OBJECT_PATH,
+        INTERFACE,
+        "GetCurrentState",
+        None,
+        None,
+        Gio.DBusCallFlags.NONE,
+        5000,
+        None,
+    )
+    return result.unpack()
+
+
+def build_command(state):
+    _, physical_monitors, logical_monitors, global_properties = state
+    physical = {spec[0]: (modes, properties) for spec, modes, properties in physical_monitors}
+
+    target = physical.get(TARGET_CONNECTOR)
+    if not target:
+        return None
+
+    _, target_properties = target
+    if SDR_NATIVE not in target_properties.get("supported-color-modes", []):
+        return None
+    if target_properties.get("color-mode") == SDR_NATIVE:
+        return []
+
+    layout_mode = "logical" if global_properties.get("layout-mode", 1) == 1 else "physical"
+    command = ["/usr/bin/gdctl", "set", "--layout-mode", layout_mode]
+
+    for x, y, scale, transform, primary, monitor_specs, _ in logical_monitors:
+        command.extend([
+            "--logical-monitor",
+            "--x", str(x),
+            "--y", str(y),
+            "--scale", str(scale),
+            "--transform", TRANSFORMS[transform],
+        ])
+        if primary:
+            command.append("--primary")
+
+        for monitor_spec in monitor_specs:
+            connector = monitor_spec[0]
+            modes, properties = physical[connector]
+            current_mode = next((mode for mode in modes if mode[-1].get("is-current")), None)
+            if current_mode is None:
+                raise RuntimeError(f"no active mode for {connector}")
+
+            color_mode = SDR_NATIVE if connector == TARGET_CONNECTOR else properties.get("color-mode", 0)
+            command.extend([
+                "--monitor", connector,
+                "--mode", current_mode[0],
+                "--color-mode", COLOR_MODES[color_mode],
+            ])
+            rgb_range = RGB_RANGES.get(properties.get("rgb-range"))
+            if rgb_range:
+                command.extend(["--rgb-range", rgb_range])
+
+    return command
+
+
+def enforce():
+    global pending_check
+    pending_check = 0
+    try:
+        command = build_command(current_state())
+        if command is None:
+            print(f"{TARGET_CONNECTOR}: missing or without sdr-native support", flush=True)
+            return GLib.SOURCE_REMOVE
+        if not command:
+            return GLib.SOURCE_REMOVE
+
+        # Validate the complete current layout before applying it with only the
+        # target color mode changed. This preserves mode, refresh, scale,
+        # transform, position and any external monitors.
+        subprocess.run(command[:2] + ["--verify"] + command[2:], check=True)
+        subprocess.run(command, check=True)
+        print(f"{TARGET_CONNECTOR}: sdr-native restored", flush=True)
+    except Exception as error:
+        print(f"failed to restore sdr-native: {error}", file=sys.stderr, flush=True)
+    return GLib.SOURCE_REMOVE
+
+
+def schedule_check(*_args):
+    global pending_check
+    if pending_check:
+        GLib.source_remove(pending_check)
+    pending_check = GLib.timeout_add(750, enforce)
+
+
+bus.signal_subscribe(
+    BUS_NAME,
+    INTERFACE,
+    "MonitorsChanged",
+    OBJECT_PATH,
+    None,
+    Gio.DBusSignalFlags.NONE,
+    schedule_check,
+)
+
+# Also repair the state once after login or service restart.
+pending_check = GLib.timeout_add_seconds(2, enforce)
+GLib.MainLoop().run()

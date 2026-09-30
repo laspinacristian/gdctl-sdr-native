@@ -1,0 +1,14 @@
+[Unit]
+Description=Keep sdr-native enabled after Mutter display reconfigurations
+PartOf=graphical-session.target
+After=graphical-session.target
+ConditionEnvironment=WAYLAND_DISPLAY
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/gdctl-sdr-native-watch
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=graphical-session.target
